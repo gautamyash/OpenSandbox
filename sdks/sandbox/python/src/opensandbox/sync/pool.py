@@ -1548,30 +1548,33 @@ class SandboxPoolSync:
                     pass
             loop = self._warmup_loop
             loop_thread = self._warmup_loop_thread
+            create_executor = self._create_executor
+            executor = self._warmup_executor
             self._warmup_loop = None
             self._warmup_loop_thread = None
-            if loop is not None:
-                loop.call_soon_threadsafe(loop.stop)
-            if (
-                loop_thread is not None
-                and loop_thread is not threading.current_thread()
-            ):
-                loop_thread.join(timeout=5)
-            if loop is not None and not loop.is_running():
-                loop.close()
-            create_executor = self._create_executor
             self._create_executor = None
-            if create_executor is not None:
-                create_executor.shutdown(wait=False, cancel_futures=True)
-                self._await_executor_threads(
-                    create_executor, _WARMUP_TERMINATION_TIMEOUT_SECONDS
-                )
-            executor = self._warmup_executor
             self._warmup_executor = None
-            if executor is not None:
-                executor.shutdown(wait=False, cancel_futures=True)
-                self._await_executor_threads(
-                    executor, _WARMUP_TERMINATION_TIMEOUT_SECONDS
+            with self._warming_lock:
+                outstanding_tokens = frozenset(self._warmup_tokens)
+            if outstanding_tokens:
+                # issue #2056: under concurrent start/shutdown stress, a warmup
+                # coroutine can still be genuinely in flight once the bounded
+                # wait above gives up -- _run_stage's own cancellation handling
+                # deliberately blocks on its underlying executor call instead of
+                # abandoning it, so that call is still running here. Closing the
+                # loop regardless used to destroy that still-pending asyncio Task
+                # ("Task was destroyed but it is pending!") and skip that
+                # warmup's own sandbox cleanup in its finally block. Finish this
+                # run's teardown on a background thread once those specific
+                # tokens actually drain, instead of on this bounded budget --
+                # start() reads self._warmup_loop/_create_executor/_warmup_executor,
+                # already cleared above, so a new run is never blocked on this.
+                self._finish_stop_reconcile_deferred(
+                    loop, loop_thread, create_executor, executor, outstanding_tokens
+                )
+            else:
+                self._finish_stop_reconcile_now(
+                    loop, loop_thread, create_executor, executor
                 )
             # Idempotent bookkeeping. Kept inside _stop_lock: start() holds
             # _stop_lock and _lifecycle_lock together, so a thread inside this
@@ -1580,6 +1583,52 @@ class SandboxPoolSync:
             # same thread.
             self._release_primary_lock_best_effort()
             self._mark_primary_lost()
+
+    def _finish_stop_reconcile_now(
+        self,
+        loop: asyncio.AbstractEventLoop | None,
+        loop_thread: threading.Thread | None,
+        create_executor: ThreadPoolExecutor | None,
+        executor: ThreadPoolExecutor | None,
+    ) -> None:
+        if loop is not None:
+            loop.call_soon_threadsafe(loop.stop)
+        if loop_thread is not None and loop_thread is not threading.current_thread():
+            loop_thread.join(timeout=5)
+        if loop is not None and not loop.is_running():
+            loop.close()
+        if create_executor is not None:
+            create_executor.shutdown(wait=False, cancel_futures=True)
+            self._await_executor_threads(
+                create_executor, _WARMUP_TERMINATION_TIMEOUT_SECONDS
+            )
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._await_executor_threads(executor, _WARMUP_TERMINATION_TIMEOUT_SECONDS)
+
+    def _finish_stop_reconcile_deferred(
+        self,
+        loop: asyncio.AbstractEventLoop | None,
+        loop_thread: threading.Thread | None,
+        create_executor: ThreadPoolExecutor | None,
+        executor: ThreadPoolExecutor | None,
+        outstanding_tokens: frozenset[int],
+    ) -> None:
+        def wait_then_finish() -> None:
+            while True:
+                with self._warming_lock:
+                    if self._warmup_tokens.isdisjoint(outstanding_tokens):
+                        break
+                time.sleep(0.01)
+            self._finish_stop_reconcile_now(
+                loop, loop_thread, create_executor, executor
+            )
+
+        threading.Thread(
+            target=wait_then_finish,
+            name="opensandbox-warmup-teardown",
+            daemon=True,
+        ).start()
 
     def _await_executor_threads(
         self, executor: ThreadPoolExecutor, timeout_seconds: float
