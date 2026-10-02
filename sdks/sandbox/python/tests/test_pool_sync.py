@@ -656,6 +656,59 @@ def test_forced_shutdown_defers_warmup_loop_close_until_stuck_stage_finishes(
         pool.shutdown(False)
 
 
+def test_forced_shutdown_closes_uncommitted_sandbox_after_stuck_stage_drains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the #2063 review comment on the fix above: deferring the
+    loop close kept the loop and executor OBJECTS referenced, but _run_stage
+    re-read self._warmup_executor on every call -- already nulled by
+    _stop_reconcile before this drain thread was even spawned -- so once the
+    stuck stage unblocked, every subsequent _run_stage call, including this
+    coroutine's own finally cleanup (`_cleanup_uncommitted_warmup`), raised
+    "warmup stage executor is stopped" and the uncommitted sandbox was never
+    killed or closed. The executor is now captured once at the top of the
+    coroutine, the same way create_executor already was, so cleanup can
+    actually run during the drain window.
+    """
+    FakeSandbox.reset()
+    entered_preparer = threading.Event()
+    release_preparer = threading.Event()
+
+    def blocking_preparer(sandbox: FakeSandbox) -> None:
+        entered_preparer.set()
+        release_preparer.wait(timeout=5)
+
+    manager = FakeManager()
+    monkeypatch.setattr(
+        sync_pool_module, "_WARMUP_TERMINATION_TIMEOUT_SECONDS", 0.05
+    )
+    pool = SandboxPoolSync(
+        pool_name="stuck-stage-cleanup-pool",
+        owner_id="owner-1",
+        max_idle=1,
+        warmup_concurrency=1,
+        state_store=InMemoryPoolStateStore(),
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        warmup_sandbox_preparer=blocking_preparer,  # type: ignore[arg-type]
+        sandbox_manager_factory=lambda config: manager,  # type: ignore[arg-type,return-value]
+        sandbox_factory=FakeSandbox,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        assert entered_preparer.wait(timeout=2)
+        sandbox = FakeSandbox.last_created
+        assert sandbox is not None
+
+        pool.shutdown(False)
+        release_preparer.set()
+
+        _eventually(lambda: sandbox.killed and sandbox.closed)
+    finally:
+        release_preparer.set()
+        pool.shutdown(False)
+
+
 def test_graceful_shutdown_restart_does_not_reuse_stop_event() -> None:
     pool = _create_pool(max_idle=0)
     pool.start()
